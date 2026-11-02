@@ -4,6 +4,8 @@ An agent developing a userscript can currently install or update it, reload a gr
 
 This proposal adds one explicitly registered callback per script and frame, plus a bounded channel for structured results. An agent could call a script's validation or calculation function with JSON input and receive its return value or error without rerunning the script's top-level initialization. A script could also deliberately report a result from an event it observes.
 
+Status as of 2026-11-02: the paired MCP and extension implementation passed all 38 real-browser regression cases in Chrome 156 (MV3). Scope and API acceptance remain open for maintainer discussion. Firefox and Chrome MV2 runtime validation are still pending; see [Validation](#validation).
+
 ## Scope decision
 
 The current [development contract](contract.md#non-goals) excludes externally driving userscripts and treats `GM_log` as the feedback boundary. Callable handlers would intentionally extend that scope. This proposal asks whether that extension is desirable before requesting a release; it does not assume that callback registration alone resolves the product or permission decision.
@@ -75,6 +77,26 @@ The MCP repository owns the three tool schemas, typed client interfaces, capabil
 
 No package version or minimum extension release is assigned by this draft. Coordinate the MCP package release and extension rollout if the proposal is accepted. The extension can be tested against a local build of this repository before publishing.
 
+## Validation
+
+The paired implementation was tested on 2026-11-02 with Google Chrome 156.0.8078.79 on macOS arm64, using a headed browser, an isolated profile and the unpacked MV3 extension build (2.49.6). The tested revisions were MCP `4fbc64eb1ac2d5347c8628730b06a4c3d97fd27a` and extension `f376fc5e7c13e24f026c0088640473c78ac88f8c`.
+
+The tests used an MCP SDK client over Streamable HTTP, the actual MCP server, its WebSocket connection to the extension, and installed userscripts. No simulated extension backend was used. The `GM_*` APIs were exercised in `@inject-into page` and the corresponding `GM.*` APIs in `@inject-into content`. Both scripts ran in the top document, a same-origin iframe and a cross-origin iframe.
+
+All 38 browser regression cases passed:
+
+| Area | Verified behavior |
+| --- | --- |
+| Calls and results | Synchronous JSON and falsy values, asynchronous returns, concurrent response correlation, unsolicited reports and exclusive result cursors |
+| Failures and limits | Thrown errors, rejected promises, circular values, BigInt, oversized inputs and outputs, missing frame handlers and disabled scripts |
+| Call lifecycle | Retained call-ID deduplication, conflicting reuse, `wait: false`, execution timeout and late completion |
+| Page restoration | Real back/forward cache restoration, renewed document channels, callable handlers in both realms and all three frame contexts, no repeated script initialization |
+| Authorization and cleanup | Revocation and regrant, rejection of cached old authorization sessions, reload, disconnect/reconnect, read-only mode and tab closure |
+
+Back and forward navigation produced trusted native `pageshow` events with `persisted === true`; the check did not substitute a reload for restoration. Script closure instances survived with an initialization count of one, while MCP document tokens changed. Navigation cancelled unfinished calls, and late replies could not overwrite those cancelled records. Restored scripts could also report results. No unexpected page JavaScript errors were observed.
+
+The MCP automated suite (25 tests), typecheck and build passed. The companion extension suite (141 tests), lint, and MV2/MV3 builds also passed. A successful MV2 build does not establish MV2 runtime behavior. Firefox and Chrome MV2 still need real-browser checks before claiming cross-browser validation. File saving remains outside this first round.
+
 ## Questions for maintainers
 
 1. Is explicit callback invocation an acceptable extension of the current development-only scope, or should the initial feature be limited to unsolicited structured reports?
@@ -82,4 +104,4 @@ No package version or minimum extension release is assigned by this draft. Coord
 3. Is the existing per-tab grant sufficient, or should invocation require an additional user-facing permission?
 4. Are the timeout, retention, deduplication and back/forward cache semantics suitable for an initial version?
 
-The companion tests cover correlation, failures, expiry, authorization, navigation and restoration. Before requesting merge, browser verification should cover Chrome and Firefox, both script realms, child frames, and actual persisted `pageshow` events.
+The Chrome results support an initial review of the paired changes. They do not settle the scope or permission decisions above. This proposal intentionally identifies an extension to the existing development contract rather than treating that extension as already accepted.
