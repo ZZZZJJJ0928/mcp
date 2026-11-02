@@ -3,7 +3,8 @@ import { createServer } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createClient, ToolCallError, type McpClient } from '@violentmonkey/mcp-client';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { ToolOutput } from '@violentmonkey/mcp-protocol';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { startServer, type RunningServer } from '../src/index';
 
 const TOKEN = 'test-token';
@@ -218,6 +219,97 @@ describe('violentmonkey mcp', () => {
     expect(JSON.stringify(res.content)).toContain('500');
   });
 
+  it('discovers registered handlers and preserves correlated structured results', async () => {
+    const ext = extension();
+    const records: Array<ToolOutput<'script_call'>['result']> = [];
+    const inputs: unknown[] = [];
+    ext.handle('script_handlers', () => ({ handlers: [{ scriptId: 1, frameId: 0 }] }));
+    ext.handle('script_call', async (input) => {
+      inputs.push(input);
+      // Complete concurrent requests in the opposite order to their dispatch.
+      if (input.callId === 'first') await new Promise(resolve => setTimeout(resolve, 30));
+      const result = {
+        callId: input.callId!, scriptId: input.scriptId, frameId: input.frameId,
+        documentId: 'document-one', seq: records.length + 1,
+        status: 'completed' as const, startedAt: 1, value: input.params,
+      };
+      records.push(result);
+      return { result };
+    });
+    ext.handle('script_results', ({ callId, afterSeq, limit }) => {
+      const entries = records.filter(r => (!callId || r.callId === callId) && r.seq > afterSeq).slice(0, limit);
+      return { entries, nextSeq: entries.at(-1)?.seq ?? afterSeq, dropped: 0 };
+    });
+    ext.connect();
+    await waitFor(() => ext.status === 'open');
+    expect((await mcp.listTools()).tools.map(t => t.name).sort()).toEqual([
+      'script_call', 'script_handlers', 'script_results', 'vm_status',
+    ]);
+    expect((await mcp.callTool({ name: 'script_handlers', arguments: { tabId: 7 } })).structuredContent)
+      .toEqual({ handlers: [{ scriptId: 1, frameId: 0 }] });
+
+    const values = [{ rows: [false, 0, '', null] }, false];
+    const responses = await Promise.all(['first', 'second'].map((callId, i) => mcp.callTool({
+      name: 'script_call', arguments: { tabId: 7, scriptId: 1, callId, params: values[i] },
+    })));
+    expect(responses[0]?.structuredContent).toMatchObject({ result: { callId: 'first', value: values[0] } });
+    expect(responses[1]?.structuredContent).toMatchObject({ result: { callId: 'second', value: false } });
+    expect(inputs[0]).toEqual({
+      tabId: 7, scriptId: 1, callId: 'first', frameId: 0, params: values[0], wait: true, timeoutMs: 10000,
+    });
+    const page = await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, limit: 1 } });
+    expect(page.structuredContent).toEqual({ entries: [records[0]], nextSeq: 1, dropped: 0 });
+    const next = await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, afterSeq: 1 } });
+    expect(next.structuredContent).toEqual({ entries: [records[1]], nextSeq: 2, dropped: 0 });
+  });
+
+  it.each(['pending', 'failed', 'timed_out', 'cancelled'] as const)(
+    'returns an execution status of %s as structured data, not a transport error', async status => {
+      const ext = extension();
+      ext.handle('script_call', ({ scriptId, frameId }) => ({ result: {
+        callId: 'call-one', scriptId, frameId, documentId: 'doc', seq: 1,
+        status, startedAt: 1, ...(status !== 'pending' && { finishedAt: 2, error: 'Script did not complete' }),
+      } }));
+      ext.connect();
+      await waitFor(() => ext.status === 'open');
+      const result = await mcp.callTool({
+        name: 'script_call', arguments: { tabId: 7, scriptId: 1, wait: false },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({ result: { status } });
+    },
+  );
+
+  it('validates execution arguments before dispatch and preserves authorization errors', async () => {
+    const ext = extension();
+    const invoke = vi.fn(() => { throw new ToolCallError(403, 'Tab is not authorized for MCP'); });
+    ext.handle('script_call', invoke);
+    ext.connect();
+    await waitFor(() => ext.status === 'open');
+    for (const invalid of [
+      { timeoutMs: 25001 }, { timeoutMs: 0 }, { scriptId: 0 }, { frameId: -1 },
+      { callId: '' }, { callId: 'x'.repeat(129) }, { wait: 'yes' },
+    ]) {
+      const result = await mcp.callTool({
+        name: 'script_call', arguments: { tabId: 7, scriptId: 1, ...invalid },
+      });
+      expect(result.isError).toBe(true);
+    }
+    expect(invoke).not.toHaveBeenCalled();
+    const denied = await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1 } });
+    expect(denied).toMatchObject({ isError: true, content: [{ type: 'text', text: '[403] Tab is not authorized for MCP' }] });
+  });
+
+  it('rejects malformed execution results from an extension', async () => {
+    const ext = extension();
+    ext.handle('script_call', () => ({ result: { status: 'unknown' } }) as never);
+    ext.connect();
+    await waitFor(() => ext.status === 'open');
+    const result = await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1 } });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain('[502]');
+  });
+
   it('propagates handler errors and validates params', async () => {
     const ext = extension();
     ext.handle('scripts_get', () => {
@@ -330,6 +422,34 @@ describe('origin check', () => {
 });
 
 describe('read-only mode', () => {
+  it('allows execution discovery and results but never forwards script_call', async () => {
+    const port = await freePort();
+    const server = await startServer({ port, token: TOKEN, transport: 'http', allowNoOrigin: true, readonly: true });
+    const mcp = new Client({ name: 'agent', version: '1' });
+    const ext = createClient({ port, token: TOKEN, info: { name: 'test', version: '1' } });
+    const invoke = vi.fn(() => { throw new Error('Must never be called'); });
+    ext.handle('script_call', invoke);
+    ext.handle('script_handlers', () => ({ handlers: [{ scriptId: 1, frameId: 0 }] }));
+    ext.handle('script_results', () => ({ entries: [], nextSeq: 0, dropped: 0 }));
+    try {
+      await mcp.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+        requestInit: { headers: { Authorization: `Bearer ${TOKEN}` } },
+      }));
+      ext.connect();
+      await waitFor(() => ext.status === 'open');
+      expect((await mcp.listTools()).tools.map(t => t.name).sort())
+        .toEqual(['script_handlers', 'script_results', 'vm_status']);
+      expect((await mcp.callTool({ name: 'script_results', arguments: { tabId: 7 } })).structuredContent)
+        .toEqual({ entries: [], nextSeq: 0, dropped: 0 });
+      expect((await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1 } })).isError).toBe(true);
+      expect(invoke).not.toHaveBeenCalled();
+    } finally {
+      ext.close();
+      await mcp.close();
+      await server.close();
+    }
+  });
+
   it('hides write tools and never forwards them', async () => {
     const port = await freePort();
     const server = await startServer({

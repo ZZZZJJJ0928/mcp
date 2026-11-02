@@ -39,10 +39,29 @@ export const logEntry = z.object({
   count: z.number().int().optional().describe('Number of identical consecutive lines collapsed'),
 });
 
+const executionScriptId = z.number().int().positive();
+const executionTabId = z.number().int().nonnegative();
+const frameId = z.number().int().nonnegative();
+const callId = z.string().min(1).max(128);
+
+export const scriptExecution = z.object({
+  callId,
+  scriptId: executionScriptId,
+  frameId,
+  documentId: z.string().describe('Opaque identity of the execution channel'),
+  seq: z.number().int().nonnegative(),
+  status: z.enum(['pending', 'completed', 'failed', 'timed_out', 'cancelled']),
+  startedAt: z.number().describe('Milliseconds since the epoch'),
+  finishedAt: z.number().optional(),
+  value: z.json().optional(),
+  error: z.string().optional(),
+});
+
 export interface ToolAnnotations {
   readOnlyHint?: boolean;
   destructiveHint?: boolean;
   idempotentHint?: boolean;
+  openWorldHint?: boolean;
 }
 
 export interface ToolDefinition<I extends z.ZodObject, O extends z.ZodObject> {
@@ -160,6 +179,55 @@ export const tools = {
       entries: z.array(logEntry),
       nextSeq: z.number().int().describe('Pass as afterSeq to poll for newer entries'),
       dropped: z.number().int().describe('Entries evicted from the buffer since the last call'),
+    }),
+    annotations: { readOnlyHint: true },
+  }),
+  script_handlers: defineTool({
+    title: 'List callable script handlers',
+    description:
+      'List scripts that registered GM_registerMcpHandler in a granted tab, with their frame ids. ' +
+      'The script must declare @grant GM_registerMcpHandler. Grant and reload the tab first.',
+    input: z.object({ tabId: executionTabId }),
+    output: z.object({ handlers: z.array(z.object({ scriptId: executionScriptId, frameId })) }),
+    annotations: { readOnlyHint: true },
+  }),
+  script_call: defineTool({
+    title: 'Call a userscript',
+    description:
+      'Invoke a registered userscript handler in a granted tab with JSON params. It may have side effects. ' +
+      'Inspect result.status for script success or failure. wait=false returns immediately; poll script_results afterwards. ' +
+      'A timeout does not stop execution. Reusing a retained callId with the same script, frame and params does not execute again; ' +
+      'deduplication ends when the result is evicted or the session ends. Do not automatically retry side effects with a new callId.',
+    input: z.object({
+      tabId: executionTabId,
+      scriptId: executionScriptId,
+      frameId: frameId.default(0),
+      params: z.json().default(null),
+      callId: callId.optional(),
+      wait: z.boolean().default(true),
+      timeoutMs: z.number().int().min(1).max(25000).default(10000),
+    }),
+    output: z.object({ result: scriptExecution }),
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  }),
+  script_results: defineTool({
+    title: 'Read script results',
+    description:
+      'Read retained structured results in a granted tab, including explicit GM_reportResult reports. ' +
+      'The script must declare @grant GM_reportResult for explicit reports. Filter by callId or scriptId, or poll with afterSeq. ' +
+      'Results are held in memory for up to five minutes with entry and size limits; dropped is cumulative. ' +
+      'Revocation, tab close or disconnect clears them. Reading does not consume results.',
+    input: z.object({
+      tabId: executionTabId,
+      scriptId: executionScriptId.optional(),
+      callId: callId.optional(),
+      afterSeq: z.number().int().nonnegative().default(0),
+      limit: z.number().int().min(1).max(100).default(50),
+    }),
+    output: z.object({
+      entries: z.array(scriptExecution),
+      nextSeq: z.number().int().nonnegative(),
+      dropped: z.number().int().nonnegative(),
     }),
     annotations: { readOnlyHint: true },
   }),
