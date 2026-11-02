@@ -106,6 +106,8 @@ The four tab tools (`tabs_list`, `tab_scripts`, `tab_reload`, `script_logs`) als
 
 Exact input/output schemas live in [`packages/protocol`](packages/protocol) and are the single source of truth.
 
+The proposed `script_handlers`, `script_call` and `script_results` tools extend this workflow with explicitly registered callbacks and structured results. They require matching extension support and are omitted for existing extensions. See the [script invocation proposal](docs/script-execution.md) for the API, authorization boundary and examples. File saving is outside this proposal.
+
 In `--readonly` mode only read-only tools are exposed, which excludes `scripts_write`, `scripts_set_enabled`, `scripts_delete` and `tab_reload`.
 
 Only tools the connected extension reports in its handshake are exposed. Before the extension connects, `tools/list` contains `vm_status` alone; the list is refreshed when the connection changes. Calling a tool that is not exposed returns an error result. A call that races a disconnect still fails with code `503` and the message `Violentmonkey is not connected`. Over the HTTP transport this is a tool result, not an HTTP status, since the HTTP request itself succeeded.
