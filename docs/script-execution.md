@@ -4,7 +4,7 @@ An agent developing a userscript can currently install or update it, reload a gr
 
 This proposal adds one explicitly registered callback per script and frame, plus a bounded channel for structured results. An agent could call a script's validation or calculation function with JSON input and receive its return value or error without rerunning the script's top-level initialization. A script could also deliberately report a result from an event it observes.
 
-Status as of 2026-11-02: the paired MCP and extension implementation passed all 38 real-browser regression cases in Chrome 156 (MV3). Scope and API acceptance remain open for maintainer discussion. Firefox and Chrome MV2 runtime validation are still pending; see [Validation](#validation).
+Status as of 2026-11-02: the paired MCP and extension implementation passed all 38 real-browser regression cases in Chrome 156 (MV3). Scope and API acceptance remain open for maintainer discussion. Firefox runtime validation is still pending; see [Validation](#validation).
 
 ## Scope decision
 
@@ -95,7 +95,9 @@ All 38 browser regression cases passed:
 
 Back and forward navigation produced trusted native `pageshow` events with `persisted === true`; the check did not substitute a reload for restoration. Script closure instances survived with an initialization count of one, while MCP document tokens changed. Navigation cancelled unfinished calls, and late replies could not overwrite those cancelled records. Restored scripts could also report results. No unexpected page JavaScript errors were observed.
 
-The MCP automated suite (25 tests), typecheck and build passed. The companion extension suite (141 tests), lint, and MV2/MV3 builds also passed. A successful MV2 build does not establish MV2 runtime behavior. Firefox and Chrome MV2 still need real-browser checks before claiming cross-browser validation. File saving remains outside this first round.
+The MCP automated suite (25 tests), typecheck and build passed. The companion extension suite (141 tests), lint, and MV2/MV3 builds also passed. Successful builds do not establish runtime compatibility. Firefox still needs real-browser checks before claiming cross-browser validation.
+
+Chrome removed Manifest V2 support starting with version 139, as documented in the [official support timeline](https://developer.chrome.com/docs/extensions/develop/migrate/mv2-deprecation-timeline). Current Chrome verification therefore targets MV3. Legacy Chrome MV2 runtime checks would require an explicitly agreed older-browser compatibility target; they are not part of current Chrome validation. File saving remains outside this first round.
 
 ## Questions for maintainers
 
