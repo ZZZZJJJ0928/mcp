@@ -99,16 +99,17 @@ Exposing the server beyond localhost (`--host 0.0.0.0`) is your responsibility; 
 | `tab_scripts` | What the extension attempted to run on a granted tab, including failures. | read-only | >=2.49.6 |
 | `tab_reload` | Reload a granted tab so scripts are re-injected. Returns the new `loadId`. | idempotent | >=2.49.6 |
 | `script_logs` | Read `GM_log` output for a granted tab, paged by a `seq` cursor. | read-only | >=2.49.6 |
+| `script_handlers` | Named handlers that userscripts registered with `GM.mcp` in a granted tab, with their descriptions and input schemas. | read-only | |
+| `script_call` | Call a registered handler with JSON params and return its result. | destructive, open-world | |
+| `script_results` | Read retained calls and reports for a granted tab, paged by a `seq` cursor. | read-only | |
 
 `—` means the tool is handled by the server and needs no Violentmonkey support. The extension reports which tools it implements when it connects, and the server exposes only those, so an unimplemented tool is never listed — it does not appear and then fail.
 
-The four tab tools (`tabs_list`, `tab_scripts`, `tab_reload`, `script_logs`) also need the user to grant a tab first. A grant is created explicitly in the Violentmonkey dashboard, lives in extension memory, and is revoked when its tab closes. Calling a tab tool on a tab that is not granted fails with `403`. `tab_reload` is a plain reload, not navigation. See [docs/contract.md](docs/contract.md) for the full contract.
+The tab tools (`tabs_list`, `tab_scripts`, `tab_reload`, `script_logs`, `script_handlers`, `script_call`, `script_results`) also need the user to grant a tab first. A grant is created explicitly in the Violentmonkey dashboard, lives in extension memory, and is revoked when its tab closes. Calling a tab tool on a tab that is not granted fails with `403`. `tab_reload` is a plain reload, not navigation. See [docs/contract.md](docs/contract.md) for the full contract.
 
 Exact input/output schemas live in [`packages/protocol`](packages/protocol) and are the single source of truth.
 
-The proposed `script_handlers`, `script_call` and `script_results` tools extend this workflow with explicitly registered, named userscript handlers and structured results. They require matching extension support and are omitted for existing extensions. See the [script invocation proposal](docs/script-execution.md) for the API, authorization boundary and examples. File saving is outside this proposal.
-
-In `--readonly` mode only read-only tools are exposed, which excludes `scripts_write`, `scripts_set_enabled`, `scripts_delete` and `tab_reload`.
+In `--readonly` mode only read-only tools are exposed, which excludes `scripts_write`, `scripts_set_enabled`, `scripts_delete`, `tab_reload` and `script_call`.
 
 Only tools the connected extension reports in its handshake are exposed. Before the extension connects, `tools/list` contains `vm_status` alone; the list is refreshed when the connection changes. Calling a tool that is not exposed returns an error result. A call that races a disconnect still fails with code `503` and the message `Violentmonkey is not connected`. Over the HTTP transport this is a tool result, not an HTTP status, since the HTTP request itself succeeded.
 
