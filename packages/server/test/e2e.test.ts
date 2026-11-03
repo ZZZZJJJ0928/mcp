@@ -219,21 +219,33 @@ describe('violentmonkey mcp', () => {
     expect(JSON.stringify(res.content)).toContain('500');
   });
 
-  it('discovers registered handlers and preserves correlated structured results', async () => {
+  it('discovers named handlers and preserves correlated calls and reports', async () => {
     const ext = extension();
-    const records: Array<ToolOutput<'script_call'>['result']> = [];
+    const records: Array<ToolOutput<'script_results'>['entries'][number]> = [];
     const inputs: unknown[] = [];
-    ext.handle('script_handlers', () => ({ handlers: [{ scriptId: 1, frameId: 0 }] }));
+    const scripts = [{
+      scriptId: 1,
+      frameId: 0,
+      handlers: [
+        { name: 'echo', description: 'Echoes params', inputSchema: { type: 'object' } },
+        { name: 'ping' },
+      ],
+    }];
+    ext.handle('script_handlers', () => ({ scripts }));
     ext.handle('script_call', async (input) => {
       inputs.push(input);
       // Complete concurrent requests in the opposite order to their dispatch.
       if (input.callId === 'first') await new Promise(resolve => setTimeout(resolve, 30));
       const result = {
-        callId: input.callId!, scriptId: input.scriptId, frameId: input.frameId,
-        documentId: 'document-one', seq: records.length + 1,
-        status: 'completed' as const, startedAt: 1, value: input.params,
+        kind: 'call' as const, callId: input.callId!, handler: input.handler,
+        scriptId: input.scriptId, frameId: input.frameId, documentId: 'document-one', seq: records.length + 1,
+        status: 'completed' as const, startedAt: 1, finishedAt: 2, value: input.params,
       };
       records.push(result);
+      records.push({
+        kind: 'report', callId: input.callId!, scriptId: input.scriptId, frameId: input.frameId,
+        documentId: 'document-one', seq: records.length + 1, reportedAt: 3, value: { progress: 1 },
+      });
       return { result };
     });
     ext.handle('script_results', ({ callId, afterSeq, limit }) => {
@@ -246,34 +258,38 @@ describe('violentmonkey mcp', () => {
       'script_call', 'script_handlers', 'script_results', 'vm_status',
     ]);
     expect((await mcp.callTool({ name: 'script_handlers', arguments: { tabId: 7 } })).structuredContent)
-      .toEqual({ handlers: [{ scriptId: 1, frameId: 0 }] });
+      .toEqual({ scripts });
 
     const values = [{ rows: [false, 0, '', null] }, false];
     const responses = await Promise.all(['first', 'second'].map((callId, i) => mcp.callTool({
-      name: 'script_call', arguments: { tabId: 7, scriptId: 1, callId, params: values[i] },
+      name: 'script_call', arguments: { tabId: 7, scriptId: 1, handler: 'echo', callId, params: values[i] },
     })));
-    expect(responses[0]?.structuredContent).toMatchObject({ result: { callId: 'first', value: values[0] } });
-    expect(responses[1]?.structuredContent).toMatchObject({ result: { callId: 'second', value: false } });
+    expect(responses[0]?.structuredContent).toMatchObject({ result: { kind: 'call', callId: 'first', value: values[0] } });
+    expect(responses[1]?.structuredContent).toMatchObject({ result: { callId: 'second', handler: 'echo', value: false } });
     expect(inputs[0]).toEqual({
-      tabId: 7, scriptId: 1, callId: 'first', frameId: 0, params: values[0], wait: true, timeoutMs: 10000,
+      tabId: 7, scriptId: 1, handler: 'echo', callId: 'first', frameId: 0, params: values[0], wait: true, timeoutMs: 10000,
     });
-    const page = await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, limit: 1 } });
-    expect(page.structuredContent).toEqual({ entries: [records[0]], nextSeq: 1, dropped: 0 });
-    const next = await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, afterSeq: 1 } });
-    expect(next.structuredContent).toEqual({ entries: [records[1]], nextSeq: 2, dropped: 0 });
+    const page = await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, limit: 2 } });
+    expect(page.structuredContent).toEqual({ entries: records.slice(0, 2), nextSeq: 2, dropped: 0 });
+    const next = await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, afterSeq: 2 } });
+    expect(next.structuredContent).toEqual({ entries: records.slice(2), nextSeq: 4, dropped: 0 });
+    const unsolicited = { kind: 'report' as const, scriptId: 1, frameId: 0, documentId: 'd', seq: 5, reportedAt: 4, value: 'ready' };
+    records.push(unsolicited);
+    expect((await mcp.callTool({ name: 'script_results', arguments: { tabId: 7, afterSeq: 4 } })).structuredContent)
+      .toEqual({ entries: [unsolicited], nextSeq: 5, dropped: 0 });
   });
 
   it.each(['pending', 'failed', 'timed_out', 'cancelled'] as const)(
     'returns an execution status of %s as structured data, not a transport error', async status => {
       const ext = extension();
-      ext.handle('script_call', ({ scriptId, frameId }) => ({ result: {
-        callId: 'call-one', scriptId, frameId, documentId: 'doc', seq: 1,
+      ext.handle('script_call', ({ scriptId, frameId, handler }) => ({ result: {
+        kind: 'call', callId: 'call-one', handler, scriptId, frameId, documentId: 'doc', seq: 1,
         status, startedAt: 1, ...(status !== 'pending' && { finishedAt: 2, error: 'Script did not complete' }),
       } }));
       ext.connect();
       await waitFor(() => ext.status === 'open');
       const result = await mcp.callTool({
-        name: 'script_call', arguments: { tabId: 7, scriptId: 1, wait: false },
+        name: 'script_call', arguments: { tabId: 7, scriptId: 1, handler: 'echo', wait: false },
       });
       expect(result.isError).not.toBe(true);
       expect(result.structuredContent).toMatchObject({ result: { status } });
@@ -289,23 +305,29 @@ describe('violentmonkey mcp', () => {
     for (const invalid of [
       { timeoutMs: 25001 }, { timeoutMs: 0 }, { scriptId: 0 }, { frameId: -1 },
       { callId: '' }, { callId: 'x'.repeat(129) }, { wait: 'yes' },
+      { handler: undefined }, { handler: '' }, { handler: 'has space' }, { handler: 'x'.repeat(65) },
     ]) {
       const result = await mcp.callTool({
-        name: 'script_call', arguments: { tabId: 7, scriptId: 1, ...invalid },
+        name: 'script_call', arguments: { tabId: 7, scriptId: 1, handler: 'echo', ...invalid },
       });
       expect(result.isError).toBe(true);
     }
     expect(invoke).not.toHaveBeenCalled();
-    const denied = await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1 } });
+    const denied = await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1, handler: 'echo' } });
     expect(denied).toMatchObject({ isError: true, content: [{ type: 'text', text: '[403] Tab is not authorized for MCP' }] });
   });
 
-  it('rejects malformed execution results from an extension', async () => {
+  it.each([
+    ['script_call', { result: { status: 'unknown' } }],
+    ['script_call', { result: { kind: 'report', scriptId: 1, frameId: 0, documentId: 'd', seq: 1, reportedAt: 1 } }],
+    ['script_results', { entries: [{ kind: 'other' }], nextSeq: 0, dropped: 0 }],
+    ['script_handlers', { scripts: [{ scriptId: 1, frameId: 0, handlers: [{ name: 'bad name' }] }] }],
+  ] as const)('rejects malformed %s output from an extension', async (name, output) => {
     const ext = extension();
-    ext.handle('script_call', () => ({ result: { status: 'unknown' } }) as never);
+    ext.handle(name, () => output as never);
     ext.connect();
     await waitFor(() => ext.status === 'open');
-    const result = await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1 } });
+    const result = await mcp.callTool({ name, arguments: { tabId: 7, scriptId: 1, handler: 'echo' } });
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain('[502]');
   });
@@ -429,7 +451,7 @@ describe('read-only mode', () => {
     const ext = createClient({ port, token: TOKEN, info: { name: 'test', version: '1' } });
     const invoke = vi.fn(() => { throw new Error('Must never be called'); });
     ext.handle('script_call', invoke);
-    ext.handle('script_handlers', () => ({ handlers: [{ scriptId: 1, frameId: 0 }] }));
+    ext.handle('script_handlers', () => ({ scripts: [{ scriptId: 1, frameId: 0, handlers: [{ name: 'echo' }] }] }));
     ext.handle('script_results', () => ({ entries: [], nextSeq: 0, dropped: 0 }));
     try {
       await mcp.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
@@ -441,7 +463,9 @@ describe('read-only mode', () => {
         .toEqual(['script_handlers', 'script_results', 'vm_status']);
       expect((await mcp.callTool({ name: 'script_results', arguments: { tabId: 7 } })).structuredContent)
         .toEqual({ entries: [], nextSeq: 0, dropped: 0 });
-      expect((await mcp.callTool({ name: 'script_call', arguments: { tabId: 7, scriptId: 1 } })).isError).toBe(true);
+      expect((await mcp.callTool({
+        name: 'script_call', arguments: { tabId: 7, scriptId: 1, handler: 'echo' },
+      })).isError).toBe(true);
       expect(invoke).not.toHaveBeenCalled();
     } finally {
       ext.close();

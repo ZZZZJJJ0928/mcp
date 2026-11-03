@@ -44,17 +44,41 @@ const executionTabId = z.number().int().nonnegative();
 const frameId = z.number().int().nonnegative();
 const callId = z.string().min(1).max(128);
 
-export const scriptExecution = z.object({
-  callId,
+const handlerName = z.string().regex(/^[\w.-]{1,64}$/).describe('Handler name from script_handlers');
+
+const executionEntry = {
   scriptId: executionScriptId,
   frameId,
-  documentId: z.string().describe('Opaque identity of the execution channel'),
+  documentId: z.string().describe('Opaque identity of the document the script ran in'),
   seq: z.number().int().nonnegative(),
+  value: z.json().optional(),
+  error: z.string().optional(),
+};
+
+export const scriptCall = z.object({
+  kind: z.literal('call'),
+  callId,
+  handler: handlerName,
+  ...executionEntry,
   status: z.enum(['pending', 'completed', 'failed', 'timed_out', 'cancelled']),
   startedAt: z.number().describe('Milliseconds since the epoch'),
   finishedAt: z.number().optional(),
-  value: z.json().optional(),
-  error: z.string().optional(),
+});
+
+export const scriptReport = z.object({
+  kind: z.literal('report'),
+  callId: callId.optional().describe('The call this report belongs to, if any'),
+  ...executionEntry,
+  reportedAt: z.number().describe('Milliseconds since the epoch'),
+});
+
+export const scriptResultEntry = z.discriminatedUnion('kind', [scriptCall, scriptReport]);
+
+export const scriptHandler = z.object({
+  name: handlerName,
+  description: z.string().optional(),
+  inputSchema: z.record(z.string(), z.json()).optional()
+    .describe('JSON Schema provided by the script as a hint; it is not validated by the extension'),
 });
 
 export interface ToolAnnotations {
@@ -185,37 +209,42 @@ export const tools = {
   script_handlers: defineTool({
     title: 'List callable script handlers',
     description:
-      'List scripts that registered GM_registerMcpHandler in a granted tab, with their frame ids. ' +
-      'The script must declare @grant GM_registerMcpHandler. Grant and reload the tab first.',
+      'List named handlers that userscripts registered with GM.mcp.register in a granted tab, per script and frame, ' +
+      'with their descriptions and input schemas. The script must declare @grant GM.mcp or GM_mcp. Grant and reload the tab first.',
     input: z.object({ tabId: executionTabId }),
-    output: z.object({ handlers: z.array(z.object({ scriptId: executionScriptId, frameId })) }),
+    output: z.object({
+      scripts: z.array(z.object({ scriptId: executionScriptId, frameId, handlers: z.array(scriptHandler) })),
+    }),
     annotations: { readOnlyHint: true },
   }),
   script_call: defineTool({
-    title: 'Call a userscript',
+    title: 'Call a userscript handler',
     description:
-      'Invoke a registered userscript handler in a granted tab with JSON params. It may have side effects. ' +
+      'Invoke a named userscript handler in a granted tab with JSON params. It may have side effects. ' +
+      'The handler validates params itself; inputSchema is only a hint. ' +
       'Inspect result.status for script success or failure. wait=false returns immediately; poll script_results afterwards. ' +
-      'A timeout does not stop execution. Reusing a retained callId with the same script, frame and params does not execute again; ' +
+      'The handler may add reports to the call, also after it settled; read them with script_results and the callId. ' +
+      'A timeout does not stop execution. Reusing a retained callId with the same script, frame, handler and params does not execute again; ' +
       'deduplication ends when the result is evicted or the session ends. Do not automatically retry side effects with a new callId.',
     input: z.object({
       tabId: executionTabId,
       scriptId: executionScriptId,
       frameId: frameId.default(0),
+      handler: handlerName,
       params: z.json().default(null),
       callId: callId.optional(),
       wait: z.boolean().default(true),
       timeoutMs: z.number().int().min(1).max(25000).default(10000),
     }),
-    output: z.object({ result: scriptExecution }),
+    output: z.object({ result: scriptCall }),
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }),
   script_results: defineTool({
     title: 'Read script results',
     description:
-      'Read retained structured results in a granted tab, including explicit GM_reportResult reports. ' +
-      'The script must declare @grant GM_reportResult for explicit reports. Filter by callId or scriptId, or poll with afterSeq. ' +
-      'Results are held in memory for up to five minutes with entry and size limits; dropped is cumulative. ' +
+      'Read retained calls and reports in a granted tab, ordered by seq. Reports come from GM.mcp.report or a handler\'s ' +
+      'call-bound report and carry the callId of their call, if any. Filter by callId (the call and its reports) or scriptId, ' +
+      'or poll with afterSeq. Results are held in memory for up to five minutes with entry and size limits; dropped is cumulative. ' +
       'Revocation, tab close or disconnect clears them. Reading does not consume results.',
     input: z.object({
       tabId: executionTabId,
@@ -225,7 +254,7 @@ export const tools = {
       limit: z.number().int().min(1).max(100).default(50),
     }),
     output: z.object({
-      entries: z.array(scriptExecution),
+      entries: z.array(scriptResultEntry),
       nextSeq: z.number().int().nonnegative(),
       dropped: z.number().int().nonnegative(),
     }),
